@@ -3,27 +3,33 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from scipy.stats import norm
+from datetime import timedelta
 
 # ==========================================
-# 1. Data Layer (模擬市場價格與存貨數據)
+# 0. Page Configuration (頁面基礎設定)
 # ==========================================
+st.set_page_config(page_title="Dynamic Inventory Financing", layout="wide", page_icon="📦")
 
+# ==========================================
+# 1. Data Layer (資料層：模擬市場價格與存貨數據)
+# ==========================================
 @st.cache_data
 def generate_inventory_market_data():
+    """產生模擬的市場價格與存貨數量資料"""
     np.random.seed(42)
     days = 100
     dates = pd.date_range(end=pd.Timestamp.today(), periods=days)
     
-    # 模擬三種不同波動特性的原物料價格 (使用幾何布朗運動概念簡化版)
-    # 1. 銅導線 (Copper Wire) - 中等波動
+    # 模擬三種不同波動特性的原物料價格
+    # 1. Copper Wire (中等波動)
     copper_returns = np.random.normal(0.0005, 0.015, days)
     copper_price = 100 * np.cumprod(1 + copper_returns)
     
-    # 2. 半導體晶片 (Semiconductor Chips) - 高波動
+    # 2. Semiconductor Chips (高波動)
     chip_returns = np.random.normal(0.001, 0.035, days)
     chip_price = 50 * np.cumprod(1 + chip_returns)
     
-    # 3. 工業包裝紙箱 (Industrial Packaging) - 低波動
+    # 3. Industrial Packaging (低波動)
     paper_returns = np.random.normal(0.0001, 0.005, days)
     paper_price = 10 * np.cumprod(1 + paper_returns)
     
@@ -34,127 +40,228 @@ def generate_inventory_market_data():
         'Industrial_Packaging': paper_price
     })
     
-    # 假設該 SME 倉庫裡的存貨數量
+    # 模擬倉庫存貨數量
     inventory_quantities = {
-        'Copper_Wire': 5000,          # 5000 單位
-        'Semiconductor_Chips': 10000, # 10000 單位
-        'Industrial_Packaging': 20000 # 20000 單位
+        'Copper_Wire': 5000,
+        'Semiconductor_Chips': 10000,
+        'Industrial_Packaging': 20000
     }
     
     return market_data, inventory_quantities
 
 # ==========================================
-# 2. Logic Layer (計量金融：VaR 與動態融資成數)
+# 2. Logic Layer (邏輯層：計量風險引擎與業務邏輯)
 # ==========================================
-
-def calculate_var_and_haircut(price_history, quantity, confidence_level=0.99, holding_period=10):
-    # 計算每日報酬率
+def calculate_risk_engine(price_history, quantity, outstanding_loan, stress_drop_pct, conf_level=0.99, hold_days=10):
+    """計算 VaR, CVaR, 動態融資成數與 Margin Call 狀態"""
     returns = price_history.pct_change().dropna()
+    daily_vol = np.std(returns)
     
-    # 統計學：計算日波動率 (Standard Deviation)
-    daily_volatility = np.std(returns)
-    
-    # 計算最新存貨總市值 (Current Portfolio Value)
+    # 目前價格與壓力測試後的價格
     current_price = price_history.iloc[-1]
-    portfolio_value = current_price * quantity
+    stressed_price = current_price * (1 - stress_drop_pct)
+    portfolio_value = stressed_price * quantity
     
-    # 計量金融：參數法計算風險值 (Parametric VaR)
-    # VaR = Portfolio_Value * Z * Volatility * sqrt(Holding_Period)
-    z_score = norm.ppf(confidence_level)
-    var_value = portfolio_value * z_score * daily_volatility * np.sqrt(holding_period)
+    # 計量模型：VaR (Value at Risk) 與 CVaR (Expected Shortfall)
+    z_score = norm.ppf(conf_level)
+    # 常態分配下的 VaR
+    var_value = portfolio_value * z_score * daily_vol * np.sqrt(hold_days)
+    # 常態分配下的 CVaR (比 VaR 更嚴格的尾部風險衡量)
+    cvar_value = portfolio_value * (norm.pdf(z_score) / (1 - conf_level)) * daily_vol * np.sqrt(hold_days)
     
-    # 動態融資成數 (Dynamic Haircut) 邏輯
-    # 基礎 Haircut 設為 20%，若 VaR 佔總價值的比例過高，則依比例增加 Haircut
-    var_pct = var_value / portfolio_value
+    # 業務邏輯：動態融資成數 (Dynamic Haircut)
+    # 使用 CVaR 來決定風險懲罰，使銀行保護力更強
+    risk_ratio = cvar_value / portfolio_value if portfolio_value > 0 else 0
     base_haircut = 0.20
-    dynamic_haircut = base_haircut + (var_pct * 1.5) # 風險懲罰係數 1.5
+    dynamic_haircut = base_haircut + (risk_ratio * 1.5)
+    dynamic_haircut = min(dynamic_haircut, 0.85) # 最高扣減率 85%
     
-    # 限制 Haircut 最大不超過 80%
-    dynamic_haircut = min(dynamic_haircut, 0.80)
-    
-    # 銀行願意核准的最大融資金額
+    # 計算最大可貸金額
     max_loan_amount = portfolio_value * (1 - dynamic_haircut)
     
-    # 預警系統 (Early Warning Trigger)
-    status = "Healthy (Low Risk)"
-    status_color = "green"
-    if dynamic_haircut > 0.50:
-        status = "Margin Call / Reduce Exposure"
+    # 判定 Margin Call 與狀態
+    margin_call_amount = 0
+    if outstanding_loan > max_loan_amount:
+        status = "MARGIN CALL"
         status_color = "red"
-    elif dynamic_haircut > 0.35:
-        status = "Watchlist (Increasing Volatility)"
+        margin_call_amount = outstanding_loan - max_loan_amount
+    elif dynamic_haircut > 0.40:
+        status = "WATCHLIST"
         status_color = "orange"
+    else:
+        status = "HEALTHY"
+        status_color = "green"
         
     return {
         'Current_Price': current_price,
+        'Stressed_Price': stressed_price,
         'Portfolio_Value': portfolio_value,
-        'Daily_Volatility': daily_volatility,
-        'VaR_Value': var_value,
+        'Daily_Vol': daily_vol,
+        'VaR': var_value,
+        'CVaR': cvar_value,
         'Haircut': dynamic_haircut,
-        'Max_Loan_Amount': max_loan_amount,
+        'Max_Loan': max_loan_amount,
+        'Margin_Call': margin_call_amount,
         'Status': status,
         'Status_Color': status_color
     }
 
 # ==========================================
-# 3. Presentation Layer (Streamlit 網頁介面)
+# 3. Presentation Layer (展示層：網頁介面)
 # ==========================================
 
-st.set_page_config(page_title="Inventory Financing MVP", layout="wide")
-st.title("📦 Dynamic Inventory Valuation & Early Warning System")
-st.markdown("Utilize **Value at Risk (VaR)** to dynamically adjust financing ratios for inventory-backed loans.")
+st.title("📦 Dynamic Inventory Valuation & Risk Engine")
+st.markdown("Powered by **VaR/CVaR Quant Models** for Real-Time Supply Chain Finance.")
 
 # 載入資料
 df_market, inventory_qty = generate_inventory_market_data()
 
-# 佈局：左側參數與存貨選擇，右側視覺化與風險指標
-col1, col2 = st.columns([1, 2])
+# --- 平台下拉式介紹與操作說明 ---
+with st.expander("ℹ️ Platform Introduction & How to Use (Click to expand)", expanded=False):
+    st.markdown("""
+    ### Welcome to the Dynamic Inventory Risk Engine
+    This platform helps banks and lenders dynamically assess the real-time value and risk of pledged inventory (e.g., raw materials, electronic components) using Wall Street-grade quantitative models.
+    
+    **How to Use:**
+    1. **Select Asset:** Choose the type of inventory pledged by the SME in the sidebar.
+    2. **Input Loan Info:** Enter the SME's current outstanding loan amount.
+    3. **Stress Testing:** Use the slider to simulate extreme market crashes (e.g., Black Swan events) to see if the collateral can withstand the shock.
+    4. **Monitor Dashboard:** - Check the **Gauge Chart** for the Dynamic Haircut.
+       - Watch the **System Alert Status**; if it turns RED, a Margin Call is triggered.
+       - Analyze the **Price Chart**, which includes a 10-day forward risk projection cone based on historical volatility.
+    """)
 
-with col1:
-    st.subheader("1. Inventory Selection")
+st.markdown("---")
+
+# --- 版面切割：左側輸入區，右側儀表板 ---
+col_input, col_dash1, col_dash2 = st.columns([1, 1.5, 1.5])
+
+with col_input:
+    st.subheader("⚙️ Scenario Inputs")
     
-    # 選擇存貨種類
+    # 選擇資產
     asset_options = ['Copper_Wire', 'Semiconductor_Chips', 'Industrial_Packaging']
-    selected_asset = st.selectbox("Select Pledged Inventory Asset:", asset_options)
+    selected_asset = st.selectbox("1. Select Pledged Asset", asset_options)
     
-    # 取得對應數值
     qty = inventory_qty[selected_asset]
     price_series = df_market[selected_asset]
+    current_val_est = price_series.iloc[-1] * qty
     
-    st.markdown("---")
-    st.subheader("2. Real-Time Asset Status")
+    # 輸入已借款金額 (預設為總價值的一半)
+    st.markdown("<br>", unsafe_allow_html=True)
+    outstanding_loan = st.number_input(
+        "2. Current Outstanding Loan ($)", 
+        min_value=0, 
+        value=int(current_val_est * 0.5), 
+        step=10000
+    )
     
-    # 呼叫計量風險引擎
-    risk_metrics = calculate_var_and_haircut(price_series, qty)
-    
-    st.metric("Total Pledged Units", f"{qty:,} units")
-    st.metric("Current Market Price (Per Unit)", f"${risk_metrics['Current_Price']:.2f}")
-    st.metric("Total Inventory Value (Market to Market)", f"${risk_metrics['Portfolio_Value']:,.0f}")
+    # 壓力測試滑桿
+    st.markdown("<br>", unsafe_allow_html=True)
+    stress_drop = st.slider(
+        "3. Market Stress Test (Price Drop %)", 
+        min_value=0.0, max_value=50.0, value=0.0, step=1.0,
+        help="Simulate an instant market crash to test collateral resilience."
+    ) / 100.0
 
-with col2:
-    st.subheader("3. Market Volatility & Price Trend (Last 100 Days)")
+# 執行核心運算
+metrics = calculate_risk_engine(price_series, qty, outstanding_loan, stress_drop)
+
+with col_dash1:
+    st.subheader("📊 Collateral Health")
     
-    # 繪製歷史價格走勢圖
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df_market['Date'], y=price_series, mode='lines', name='Asset Price', line=dict(color='royalblue', width=2)))
-    fig.update_layout(height=250, margin=dict(l=0, r=0, t=30, b=0), xaxis_title="Date", yaxis_title="Price (USD)")
-    st.plotly_chart(fig, use_container_width=True)
+    # 狀態與 Margin Call 警告特效
+    if metrics['Status'] == 'MARGIN CALL':
+        st.error(f"🚨 **{metrics['Status']} TRIGGERED!** Shortfall: **${metrics['Margin_Call']:,.0f}**")
+    elif metrics['Status'] == 'WATCHLIST':
+        st.warning(f"⚠️ **{metrics['Status']}**: High volatility detected. Monitor closely.")
+    else:
+        st.success(f"✅ **{metrics['Status']}**: Collateral value is sufficient.")
+        
+    # 核心財務指標
+    st.metric("Total Pledged Units", f"{qty:,}")
+    st.metric("Stressed Portfolio Value", f"${metrics['Portfolio_Value']:,.0f}", 
+              delta=f"-{stress_drop*100}% Stress Applied" if stress_drop > 0 else None, 
+              delta_color="inverse")
+    st.metric("Max Allowable Loan", f"${metrics['Max_Loan']:,.0f}")
+
+with col_dash2:
+    st.subheader("⚖️ Risk Metrics")
     
-    st.markdown("---")
-    st.subheader("4. Quant Risk Engine & Loan Decision")
+    # 繪製動態融資成數 Gauge Chart
+    fig_gauge = go.Figure(go.Indicator(
+        mode = "gauge+number",
+        value = metrics['Haircut'] * 100,
+        number = {'suffix': "%", 'valueformat': ".1f"},
+        title = {'text': "Dynamic Haircut", 'font': {'size': 18}},
+        gauge = {
+            'axis': {'range': [0, 100], 'tickwidth': 1, 'tickcolor': "darkblue"},
+            'bar': {'color': "black"},
+            'steps': [
+                {'range': [0, 35], 'color': "#A3E4D7"}, # 淺綠 (安全)
+                {'range': [35, 55], 'color': "#F9E79F"}, # 淺黃 (警戒)
+                {'range': [55, 100], 'color': "#F5B7B1"} # 淺紅 (危險)
+            ],
+            'threshold': {
+                'line': {'color': "red", 'width': 4},
+                'thickness': 0.75,
+                'value': metrics['Haircut'] * 100
+            }
+        }
+    ))
+    fig_gauge.update_layout(height=220, margin=dict(l=20, r=20, t=40, b=20))
+    st.plotly_chart(fig_gauge, use_container_width=True)
     
-    # 顯示狀態預警
-    st.markdown(f"### System Alert Status: :{risk_metrics['Status_Color']}[{risk_metrics['Status']}]")
-    
-    r1, r2, r3 = st.columns(3)
-    # 顯示年化波動率 (日波動率 * sqrt(252))
-    ann_vol = risk_metrics['Daily_Volatility'] * np.sqrt(252)
-    r1.metric("Annualized Volatility", f"{ann_vol * 100:.2f}%")
-    
-    # 顯示 10 天期 99% VaR
-    r2.metric("10-Day VaR (99% Confidence)", f"${risk_metrics['VaR_Value']:,.0f}")
-    
-    # 顯示動態融資成數
-    r3.metric("Dynamic Haircut Ratio", f"{risk_metrics['Haircut'] * 100:.1f}%")
-    
-    st.info(f"💡 **Financing Decision:** Based on the VaR risk assessment, the maximum allowable loan amount for this inventory is **${risk_metrics['Max_Loan_Amount']:,.0f}**.")
+    # 顯示進階計量指標
+    c1, c2 = st.columns(2)
+    c1.metric("10-Day VaR (99%)", f"${metrics['VaR']:,.0f}")
+    c2.metric("10-Day CVaR (99%)", f"${metrics['CVaR']:,.0f}")
+
+st.markdown("---")
+
+# --- 底部寬版區域：價格走勢與未來風險預測區間 ---
+st.subheader("📈 Historical Trend & 10-Day Forward Risk Projection")
+
+fig_price = go.Figure()
+
+# 1. 歷史價格線
+fig_price.add_trace(go.Scatter(
+    x=df_market['Date'], y=price_series, 
+    mode='lines', name='Historical Price', 
+    line=dict(color='#2E86C1', width=2)
+))
+
+# 2. 建立未來 10 天的日期 (VaR Projection)
+last_date = df_market['Date'].iloc[-1]
+future_dates = [last_date + timedelta(days=i) for i in range(11)]
+
+# 計算未來 10 天的預期價格下限 (使用 VaR 換算回單位價格)
+unit_var_drop = metrics['VaR'] / qty
+current_p = metrics['Current_Price']
+# 為了視覺化，畫一個平滑的扇形擴散 (依照時間平方根遞增風險)
+upper_bound = [current_p] * 11
+lower_bound = [current_p - (unit_var_drop * np.sqrt(i/10)) for i in range(11)]
+
+# 3. 畫出未來 10 天的 VaR 信心區間 (陰影)
+fig_price.add_trace(go.Scatter(
+    x=future_dates, y=upper_bound, 
+    mode='lines', line=dict(width=0), 
+    showlegend=False, hoverinfo='skip'
+))
+fig_price.add_trace(go.Scatter(
+    x=future_dates, y=lower_bound, 
+    mode='lines', name='99% Risk Floor (VaR)', 
+    fill='tonexty', fillcolor='rgba(231, 76, 60, 0.2)', # 半透明紅色
+    line=dict(color='#E74C3C', width=2, dash='dash')
+))
+
+fig_price.update_layout(
+    height=350, 
+    margin=dict(l=0, r=0, t=30, b=0),
+    xaxis_title="Date", 
+    yaxis_title="Price per Unit (USD)",
+    hovermode="x unified",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+)
+
+st.plotly_chart(fig_price, use_container_width=True)
